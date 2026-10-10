@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { startFakeGoogle, type FakeIdentity } from '../dev/fake-google.js';
-import { addSecret, api, browserFor, connectAgent, form, page, signInAs, startEnv, type TestEnv } from './helpers.js';
+import { addSecret, api, browserFor, codeFor, connectAgent, enrollAuthenticator, form, page, refreshUser, signInAs, startEnv, type TestEnv } from './helpers.js';
 
 describe('Google sign-in', () => {
   let env: TestEnv;
@@ -52,15 +52,27 @@ describe('Google sign-in', () => {
     expect(unverified.res.status).toBe(403);
   });
 
+  const now = () => Math.floor(env.clock.now().getTime() / 1000);
+  const owner = (authTime?: number): FakeIdentity => ({ sub: 'g-1', email: 'owner@example.com', email_verified: true, name: 'Owner', auth_time: authTime });
+
   it('re-auth asks Google for max_age and requires the same account', async () => {
-    const { jar } = await signInFlow({ sub: 'g-1', email: 'owner@example.com', email_verified: true, name: 'Owner' });
+    const { jar } = await signInFlow(owner());
     env.clock.advance(6 * 60);
-    const stale = await signInFlow({ sub: 'g-1', email: 'owner@example.com', email_verified: true, name: 'Owner' }, '/secrets/new', jar);
+    const fresh = await signInFlow(owner(now()), '/secrets/new', jar);
     expect(oidc.state.lastAuthorize?.get('max_age')).toBe('0');
-    expect(stale.finalUrl).toBe(`${env.baseUrl}/secrets/new`);
+    expect(fresh.finalUrl).toBe(`${env.baseUrl}/secrets/new`);
     env.clock.advance(6 * 60);
-    const other = await signInFlow({ sub: 'g-9', email: 'other@example.com', email_verified: true, name: 'X' }, '/auth/google?purpose=reauth&return_to=/', jar);
+    const other = await signInFlow({ sub: 'g-9', email: 'other@example.com', email_verified: true, name: 'X', auth_time: now() }, '/auth/google?purpose=reauth&return_to=/', jar);
     expect(other.res.status).toBe(403);
+  });
+
+  it('re-auth is refused when Google does not prove a fresh sign-in', async () => {
+    const { jar } = await signInFlow(owner());
+    env.clock.advance(6 * 60);
+    const missing = await signInFlow(owner(), '/auth/google?purpose=reauth&return_to=/', jar);
+    expect(missing.res.status).toBe(403);
+    const old = await signInFlow(owner(now() - 3600), '/auth/google?purpose=reauth&return_to=/', jar);
+    expect(old.res.status).toBe(403);
   });
 
   it('rejects a callback without the browser-bound login state', async () => {
@@ -111,6 +123,39 @@ describe('web UI protections', () => {
     expect((await page(env, b, '/')).status).toBe(200);
   });
 
+  it('ignores flash text in the URL, so an agent cannot add words to the approval page', async () => {
+    const o = await signInAs(env, 'owner@example.com');
+    const b = await browserFor(env, o.user, o.workspaceId);
+    const html = await (await page(env, b, '/?flash=Verified%20safe%20to%20approve')).text();
+    expect(html).not.toContain('Verified safe to approve');
+  });
+
+  it('replacing an enrolled authenticator needs a current code from it', async () => {
+    const o = await signInAs(env, 'owner@example.com');
+    const seed = await enrollAuthenticator(env, o.user);
+    const b = await browserFor(env, await refreshUser(env, o.user), o.workspaceId);
+    expect((await form(env, b, '/settings/authenticator', {})).status).toBe(400);
+    expect((await form(env, b, '/settings/authenticator', { current_code: '000000' })).status).toBe(400);
+    const ok = await form(env, b, '/settings/authenticator', { current_code: await codeFor(env, seed) });
+    expect(ok.status).toBe(200);
+    expect(await ok.text()).toContain('Scan this with Google Authenticator');
+  });
+
+  it('the consent page shows where the code is really sent', async () => {
+    const o = await signInAs(env, 'owner@example.com');
+    const b = await browserFor(env, o.user, o.workspaceId);
+    const reg = await (await fetch(`${env.baseUrl}/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ client_name: 'Claude Code', redirect_uris: ['http://127.0.0.1:33418/callback', 'https://attacker.example/cb'] }),
+    })).json();
+    const auth = await fetch(`${env.baseUrl}/authorize?${new URLSearchParams({ response_type: 'code', client_id: reg.client_id, redirect_uri: 'https://attacker.example/cb', code_challenge: 'x'.repeat(43), code_challenge_method: 'S256' })}`, { redirect: 'manual' });
+    const html = await (await page(env, b, auth.headers.get('location')!)).text();
+    expect(html).toContain('https://attacker.example/cb');
+    expect(html).toContain('This is a website, not an app on your computer');
+    expect(html).not.toContain('<code>http://127.0.0.1:33418');
+  });
+
   it('sets security headers and keeps secret values off every page', async () => {
     const o = await signInAs(env, 'owner@example.com');
     const b = await browserFor(env, o.user, o.workspaceId);
@@ -138,6 +183,25 @@ describe('web UI protections', () => {
     expect((await api(env, agent, 'GET', '/v1/secrets')).status).toBe(401);
     // Their session stops working too.
     expect((await page(env, tb, '/')).status).toBe(302);
+  });
+
+  it('managed mode: an invite never pulls a new user into someone else\'s workspace', async () => {
+    await env.close();
+    env = await startEnv({ mode: 'managed', ownerEmail: undefined });
+    const mallory = await signInAs(env, 'mallory@example.com');
+    const mb = await browserFor(env, mallory.user, mallory.workspaceId);
+    expect((await form(env, mb, '/members', { email: 'victim@example.com' })).status).toBe(303);
+    const victim = await signInAs(env, 'victim@example.com');
+    expect(victim.workspaceId).not.toBe(mallory.workspaceId);
+    const [role] = await env.ctx.db.query<{ role: string }>('select role from memberships where workspace_id = $1 and user_id = $2', [victim.workspaceId, victim.user.id]);
+    expect(role?.role).toBe('owner');
+    const vb = await browserFor(env, victim.user, victim.workspaceId);
+    const settings = await (await page(env, vb, '/settings')).text();
+    expect(settings).toContain('Invitations');
+    // Accepting is explicit.
+    expect((await form(env, vb, `/invites/${mallory.workspaceId}/accept`, {})).status).toBe(303);
+    const [joined] = await env.ctx.db.query<{ user_id: string }>('select user_id from memberships where workspace_id = $1 and email = $2', [mallory.workspaceId, 'victim@example.com']);
+    expect(joined?.user_id).toBe(victim.user.id);
   });
 
   it('managed mode gives each new user a private workspace', async () => {

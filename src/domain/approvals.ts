@@ -173,7 +173,7 @@ export async function approveWithTotp(ctx: AppContext, approver: User, workspace
     `update approval_requests set failed_attempts = failed_attempts + 1,
        status = case when failed_attempts + 1 >= $2 then 'denied' else status end,
        decision_method = case when failed_attempts + 1 >= $2 then 'deny' else decision_method end
-     where id = $1 returning failed_attempts`,
+     where id = $1 and status = 'pending' returning failed_attempts`,
     [id, MAX_ATTEMPTS_PER_REQUEST],
   );
   await audit(ctx, {

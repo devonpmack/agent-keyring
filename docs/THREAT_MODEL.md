@@ -67,8 +67,10 @@ per-secret opt-in. The code reaches the model context and any logs the client ke
 Mitigations: the code is single-use (after a code is accepted, no code for that time
 step or an earlier one is accepted again), it must be sent with the pending request ID
 it approves, and only within 5 minutes of that request. It is checked against the
-authenticator of the human who connected that agent. A code typed for request A cannot approve request B, and a
-code the server has already accepted is rejected. Residual risk, documented: an injected
+authenticator of the human who connected that agent. A code the server has already
+accepted is rejected, so one typed code approves at most one request. The server cannot
+know which request the human *meant*: the agent chooses the request ID it pairs the
+code with. Residual risk, documented: an injected
 agent can open a request for secret X while telling the user it is for secret Y, so path
 (b) is only for secrets where that confusion is acceptable. A second residual: an injected
 agent can submit wrong codes to lock that human's approvals for 15 minutes (a denial of
@@ -92,15 +94,20 @@ one-way door. Mitigations are operational: the service identity is the only prin
 with `decrypt`, KMS audit logs are on, and key rotation plus re-wrapping is scripted.
 
 **Human session hijack / CSRF.** Admin actions need a Google re-auth within the last
-5 minutes (`max_age` / `auth_time` check). All state-changing form posts carry a CSRF
+5 minutes (`max_age=0` is sent and a fresh `auth_time` is required; a token without one
+is refused). Replacing an enrolled authenticator additionally needs a current code from
+it, so a hijacked session cannot swap in its own and then approve requests. Flash
+messages travel in a one-time cookie, never the URL, so an agent cannot add text to the
+approval link it shows the human. All state-changing form posts carry a CSRF
 token. Nothing secret ever goes in a URL (secret values, codes and tokens travel only
 in bodies or headers), so referrers and access logs are clean.
 
 **Malicious client via dynamic registration.** Registration only creates an inert
 public client (no client secrets are issued or stored), with redirect URIs limited to
 https, loopback http or private-use schemes. A human must complete the consent screen,
-which needs a fresh Google re-auth and shows the client name *and* its redirect URI
-host, and chooses the scope (a folder, optionally narrowed by tags or paths). Clients
+which needs a fresh Google re-auth and shows the client name *and* the exact redirect
+URI the code will be sent to (with a warning when it is a website rather than a local
+app), and chooses the scope (a folder, optionally narrowed by tags or paths). Clients
 that have never been approved are labeled as new. A replayed authorization code revokes
 the grant it produced.
 
@@ -112,7 +119,10 @@ one request deny it. With 10^6 codes and those limits, guessing is not practical
 this: the browser only signs for the vault's origin, and the challenge is derived from
 the approval request ID, so a signature cannot be relayed to approve something else.
 
-**Another tenant (managed mode).** Every query is scoped by workspace ID, grants carry
+**Another tenant (managed mode).** Invites never auto-join: every new user gets their
+own workspace, and joining another one is an explicit accept (members can approve each
+other's requests, so membership is a trust decision). The consent page's "new client"
+label only counts grants in the user's own workspaces. Every query is scoped by workspace ID, grants carry
 their workspace, and every ciphertext binds `workspace_id:secret_id` as authenticated
 data at both encryption layers, so even a query bug that returned another tenant's row
 would not decrypt under the wrong context. Removing a member revokes the grants they

@@ -157,6 +157,17 @@ describe('approval policy', () => {
     expect((await approveOnWeb(fresh.body.request_id)).status).toBe(303);
   });
 
+  it('parallel wrong codes cannot run past the lockout', async () => {
+    const { body } = await fetchSecret('prod/stripe/API_KEY');
+    await Promise.all(Array.from({ length: 12 }, () => approveOnWeb(body.request_id, '000000')));
+    const rejected = await env.ctx.db.query<{ detail: { locked: boolean } }>(`select detail from audit_events where action = 'approval.code_rejected'`);
+    expect(rejected.filter(r => !r.detail.locked).length).toBeLessThanOrEqual(4);
+    const [user] = await env.ctx.db.query<{ totp_locked_until: Date | null }>('select totp_locked_until from users');
+    expect(user?.totp_locked_until).not.toBeNull();
+    const fresh = await fetchSecret('prod/stripe/API_KEY');
+    expect((await approveOnWeb(fresh.body.request_id)).status).toBe(423);
+  });
+
   it('denies a request outright after five wrong codes on it', async () => {
     const { body } = await fetchSecret('prod/stripe/API_KEY');
     for (let i = 0; i < 4; i++) await approveOnWeb(body.request_id, '000000');

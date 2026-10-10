@@ -5,11 +5,9 @@ import type { AppContext } from '../domain/context.js';
 import { addSeconds } from '../domain/context.js';
 import { AppError } from '../domain/errors.js';
 import { signIn } from '../domain/users.js';
-import { cookieNames, cookieOptions, createSession, destroySession, safeReturnTo } from './session.js';
+import { cookieNames, cookieOptions, createSession, destroySession, RECENT_AUTH_SECONDS, safeReturnTo } from './session.js';
 
 const LOGIN_STATE_TTL = 10 * 60;
-// How fresh Google's auth_time must be for a re-auth to count.
-const REAUTH_MAX_AGE = 10 * 60;
 
 export function googleRouter(ctx: AppContext): Router {
   const router = Router();
@@ -92,8 +90,10 @@ export function googleRouter(ctx: AppContext): Router {
         if (!req.session) throw new AppError('login_expired', 'Your session ended. Sign in again.');
         const [row] = await ctx.db.query<{ google_sub: string }>('select google_sub from users where id = $1', [req.session.user.id]);
         if (row?.google_sub !== claims.sub) throw new AppError('reauth_mismatch', 'Re-authenticate with the same Google account you signed in with.', 403);
+        // Google returns auth_time when max_age is requested. Without a fresh one
+        // there is no evidence the user re-authenticated, so refuse.
         const authTime = typeof claims.auth_time === 'number' ? claims.auth_time : undefined;
-        if (authTime !== undefined && ctx.clock.now().getTime() / 1000 - authTime > REAUTH_MAX_AGE) {
+        if (authTime === undefined || ctx.clock.now().getTime() / 1000 - authTime > RECENT_AUTH_SECONDS) {
           throw new AppError('reauth_stale', 'Google did not re-check your sign-in. Sign out of Google in this browser and try again.', 403);
         }
         await ctx.db.query('update sessions set auth_at = $2 where id_hash = $1', [req.session.idHash, ctx.clock.now()]);

@@ -17,11 +17,11 @@ import {
   type Challenge,
 } from '../domain/passkeys.js';
 import { createSecret, deleteSecret, foldersOf, getSecret, listSecrets, updateSecret } from '../domain/secrets.js';
-import { confirmEnrollment, startEnrollment } from '../domain/totp.js';
-import { addMember, listMembers, listMemberships, removeMember, roleIn } from '../domain/users.js';
+import { confirmEnrollment, startEnrollment, verifyUserCode } from '../domain/totp.js';
+import { acceptInvite, addMember, declineInvite, listInvites, listMembers, listMemberships, removeMember, roleIn } from '../domain/users.js';
 import { approveAuthorization, denyAuthorization, getAuthorization } from '../oauth/consent.js';
 import { resourcesOf } from '../oauth/provider.js';
-import { destroySession, requireOwner, requireRecentAuth, requireUser, safeReturnTo, verifyCsrf, type Session } from './session.js';
+import { cookieNames, cookieOptions, destroySession, requireOwner, requireRecentAuth, requireUser, safeReturnTo, verifyCsrf, type Session } from './session.js';
 import * as views from './views.js';
 
 const formBool = z.preprocess(v => v === '1' || v === 'on' || v === true, z.boolean());
@@ -35,18 +35,32 @@ export function webRouter(ctx: AppContext): Router {
 
   const session = (req: Request): Session => req.session!;
 
-  async function chrome(req: Request, extra: Partial<views.PageChrome> = {}): Promise<views.PageChrome> {
+  // Flash messages ride in a one-time cookie, never the URL: an agent controls
+  // the approval link it shows the human and must not be able to add text to it.
+  router.use((req, res, next) => {
+    const flash: unknown = req.cookies?.[cookieNames(ctx).flash];
+    if (typeof flash === 'string') {
+      res.locals.flash = flash.slice(0, 200);
+      res.clearCookie(cookieNames(ctx).flash, { path: '/' });
+    }
+    next();
+  });
+
+  async function chrome(req: Request, res: Response, extra: Partial<views.PageChrome> = {}): Promise<views.PageChrome> {
     const s = session(req);
     const [memberships, pending] = await Promise.all([
       listMemberships(ctx, s.user.id),
       ctx.db.query<{ n: number }>(`select count(*)::int as n from approval_requests where workspace_id = $1 and status = 'pending' and expires_at > $2`, [s.workspaceId, ctx.clock.now()]),
     ]);
-    const flash = typeof req.query.flash === 'string' ? req.query.flash.slice(0, 200) : undefined;
-    return { session: s, memberships, pendingCount: pending[0]?.n ?? 0, flash, ...extra };
+    return { session: s, memberships, pendingCount: pending[0]?.n ?? 0, flash: res.locals.flash as string | undefined, ...extra };
   }
 
   const send = (res: Response, page: string) => res.type('html').send(page);
-  const back = (res: Response, path: string, flash: string) => res.redirect(303, `${path}?flash=${encodeURIComponent(flash)}`);
+  const setFlash = (res: Response, flash: string) => res.cookie(cookieNames(ctx).flash, flash, cookieOptions(ctx, 60));
+  const back = (res: Response, path: string, flash: string) => {
+    setFlash(res, flash);
+    res.redirect(303, path);
+  };
 
   router.get('/login', (req, res) => {
     if (req.session) return res.redirect(302, safeReturnTo(req.query.return_to));
@@ -70,12 +84,12 @@ export function webRouter(ctx: AppContext): Router {
   router.get('/', requireUser, async (req, res) => {
     const secrets = await listSecrets(ctx, session(req).workspaceId);
     const folder = typeof req.query.folder === 'string' ? req.query.folder : undefined;
-    send(res, views.secretsPage(await chrome(req), secrets, foldersOf(secrets), folder));
+    send(res, views.secretsPage(await chrome(req, res), secrets, foldersOf(secrets), folder));
   });
 
   router.get('/secrets/new', requireUser, recent, async (req, res) => {
     const folders = foldersOf(await listSecrets(ctx, session(req).workspaceId));
-    send(res, views.newSecretPage(await chrome(req), typeof req.query.folder === 'string' ? req.query.folder : '', folders));
+    send(res, views.newSecretPage(await chrome(req, res), typeof req.query.folder === 'string' ? req.query.folder : '', folders));
   });
 
   router.post('/secrets', requireUser, recent, async (req, res) => {
@@ -97,7 +111,7 @@ export function webRouter(ctx: AppContext): Router {
     const s = session(req);
     const secret = await getSecret(ctx, s.workspaceId, z.uuid().parse(req.params.id));
     const recentEvents = await listAudit(ctx, s.workspaceId, { secret: joinPath(secret.folder, secret.name), limit: 20 });
-    send(res, views.secretPage(await chrome(req), secret, recentEvents));
+    send(res, views.secretPage(await chrome(req, res), secret, recentEvents));
   });
 
   router.post('/secrets/:id', requireUser, recent, async (req, res) => {
@@ -122,7 +136,7 @@ export function webRouter(ctx: AppContext): Router {
   // ---- Approvals ----
 
   router.get('/approvals', requireUser, async (req, res) => {
-    send(res, views.approvalsPage(await chrome(req), await listApprovals(ctx, session(req).workspaceId)));
+    send(res, views.approvalsPage(await chrome(req, res), await listApprovals(ctx, session(req).workspaceId)));
   });
 
   const approvalId = (req: Request) => z.string().regex(/^[0-9A-Z]{10}$/).parse(req.params.id);
@@ -131,7 +145,7 @@ export function webRouter(ctx: AppContext): Router {
     const s = session(req);
     const view = await getApprovalView(ctx, s.workspaceId, approvalId(req));
     const passkeys = await listPasskeys(ctx, s.user.id);
-    send(res, views.approvalPage(await chrome(req), view, { hasAuthenticator: !!s.user.totp_enrolled_at, hasPasskey: passkeys.length > 0 }));
+    send(res, views.approvalPage(await chrome(req, res), view, { hasAuthenticator: !!s.user.totp_enrolled_at, hasPasskey: passkeys.length > 0 }));
   });
 
   router.post('/approvals/:id/approve', requireUser, async (req, res) => {
@@ -143,7 +157,7 @@ export function webRouter(ctx: AppContext): Router {
       if (!(err instanceof AppError) || (err.code !== 'invalid_code' && err.code !== 'locked')) throw err;
       const view = await getApprovalView(ctx, s.workspaceId, id);
       const passkeys = await listPasskeys(ctx, s.user.id);
-      return send(res.status(err.status), views.approvalPage(await chrome(req, { error: err.message }), view, { hasAuthenticator: true, hasPasskey: passkeys.length > 0 }));
+      return send(res.status(err.status), views.approvalPage(await chrome(req, res, { error: err.message }), view, { hasAuthenticator: true, hasPasskey: passkeys.length > 0 }));
     }
     back(res, `/approvals/${id}`, 'Approved. The agent can fetch the secret once.');
   });
@@ -173,13 +187,14 @@ export function webRouter(ctx: AppContext): Router {
     await saveChallenge(s, null);
     await verifyApprovalAssertion(ctx, s.user, id, s.webauthnChallenge, req.body);
     await approveWithPasskey(ctx, s.user, s.workspaceId, id, req.ip);
-    res.json({ ok: true, redirect: `/approvals/${id}?flash=${encodeURIComponent('Approved with passkey.')}` });
+    setFlash(res, 'Approved with passkey.');
+    res.json({ ok: true, redirect: `/approvals/${id}` });
   });
 
   // ---- Agents ----
 
   router.get('/agents', requireUser, async (req, res) => {
-    send(res, views.agentsPage(await chrome(req), await listGrants(ctx, session(req).workspaceId), resourcesOf(ctx).mcp));
+    send(res, views.agentsPage(await chrome(req, res), await listGrants(ctx, session(req).workspaceId), resourcesOf(ctx).mcp));
   });
 
   router.post('/agents/:id/revoke', requireUser, recent, async (req, res) => {
@@ -197,22 +212,42 @@ export function webRouter(ctx: AppContext): Router {
     };
     const before = typeof req.query.before === 'string' ? new Date(req.query.before) : undefined;
     const rows = await listAudit(ctx, session(req).workspaceId, { ...filter, before: before && !isNaN(before.getTime()) ? before : undefined, limit: 100 });
-    send(res, views.auditPage(await chrome(req), rows, filter));
+    send(res, views.auditPage(await chrome(req, res), rows, filter));
   });
 
   // ---- Settings: authenticator and passkeys ----
 
   router.get('/settings', requireUser, async (req, res) => {
     const s = session(req);
-    send(res, views.settingsPage(await chrome(req), { enrolledAt: s.user.totp_enrolled_at, passkeys: await listPasskeys(ctx, s.user.id) }));
+    const [passkeys, invites] = await Promise.all([listPasskeys(ctx, s.user.id), listInvites(ctx, s.user)]);
+    send(res, views.settingsPage(await chrome(req, res), { enrolledAt: s.user.totp_enrolled_at, passkeys, invites }));
   });
 
+  // Replacing an enrolled authenticator needs a code from the old one, so a
+  // hijacked session (even with a fresh Google re-auth) cannot swap in its own.
   router.post('/settings/authenticator', requireUser, recent, async (req, res) => {
     const s = session(req);
+    if (s.user.totp_enrolled_at) {
+      const check = await verifyUserCode(ctx, s.user.id, String(req.body.current_code ?? ''), s.workspaceId);
+      if (!check.ok && check.locked) throw new AppError('locked', 'Too many wrong codes. Try again in 15 minutes.', 423);
+      if (!check.ok) throw new AppError('invalid_code', 'That is not a current code from your authenticator.');
+    }
     const { uri, secret } = await startEnrollment(ctx, s.user);
     const qr = await QRCode.toDataURL(uri, { margin: 1, width: 200 });
-    res.set('Cache-Control', 'no-store');
-    send(res, views.settingsPage(await chrome(req), { enrolledAt: s.user.totp_enrolled_at, enrollment: { qr, secret }, passkeys: await listPasskeys(ctx, s.user.id) }));
+    const [passkeys, invites] = await Promise.all([listPasskeys(ctx, s.user.id), listInvites(ctx, s.user)]);
+    send(res, views.settingsPage(await chrome(req, res), { enrolledAt: s.user.totp_enrolled_at, enrollment: { qr, secret }, passkeys, invites }));
+  });
+
+  router.post('/invites/:workspaceId/accept', requireUser, async (req, res) => {
+    const workspaceId = z.uuid().parse(req.params.workspaceId);
+    await acceptInvite(ctx, session(req).user, workspaceId);
+    await ctx.db.query('update sessions set workspace_id = $2 where id_hash = $1', [session(req).idHash, workspaceId]);
+    back(res, '/', 'Joined the workspace');
+  });
+
+  router.post('/invites/:workspaceId/decline', requireUser, async (req, res) => {
+    await declineInvite(ctx, session(req).user, z.uuid().parse(req.params.workspaceId));
+    back(res, '/settings', 'Invitation declined');
   });
 
   router.post('/settings/authenticator/confirm', requireUser, recent, async (req, res) => {
@@ -232,7 +267,8 @@ export function webRouter(ctx: AppContext): Router {
     await saveChallenge(s, null);
     const body = z.object({ name: z.string().max(60).default('Passkey'), response: z.any() }).parse(req.body);
     await finishRegistration(ctx, s.user, s.workspaceId, s.webauthnChallenge, body.response, body.name);
-    res.json({ ok: true, redirect: `/settings?flash=${encodeURIComponent('Passkey added')}` });
+    setFlash(res, 'Passkey added');
+    res.json({ ok: true, redirect: '/settings' });
   });
 
   router.post('/settings/passkeys/:id/delete', requireUser, recent, async (req, res) => {
@@ -243,7 +279,7 @@ export function webRouter(ctx: AppContext): Router {
   // ---- Members (allowlist) ----
 
   router.get('/members', requireUser, requireOwner, async (req, res) => {
-    send(res, views.membersPage(await chrome(req), await listMembers(ctx, session(req).workspaceId), ctx.config.mode));
+    send(res, views.membersPage(await chrome(req, res), await listMembers(ctx, session(req).workspaceId), ctx.config.mode));
   });
 
   router.post('/members', requireUser, requireOwner, recent, async (req, res) => {
@@ -264,14 +300,14 @@ export function webRouter(ctx: AppContext): Router {
 
   router.get('/oauth/consent/:id', requireUser, recent, async (req, res) => {
     const s = session(req);
-    const authz = await getAuthorization(ctx, authzId(req));
+    const authz = await getAuthorization(ctx, authzId(req), s.user.id);
     const [folders, workspaces] = await Promise.all([listSecrets(ctx, s.workspaceId).then(foldersOf), listMemberships(ctx, s.user.id)]);
-    send(res, views.consentPage(await chrome(req), authz, { folders, workspaces }));
+    send(res, views.consentPage(await chrome(req, res), authz, { folders, workspaces }));
   });
 
   router.post('/oauth/consent/:id', requireUser, recent, async (req, res) => {
     const id = authzId(req);
-    if (req.body.decision !== 'approve') return res.redirect(303, await denyAuthorization(ctx, id));
+    if (req.body.decision !== 'approve') return res.redirect(303, await denyAuthorization(ctx, session(req).user, id));
     const target = await approveAuthorization(
       ctx,
       session(req).user,

@@ -18,7 +18,8 @@
     "typecheck": "tsc --noEmit",
     "migrate": "node dist/db/migrate-cli.js",
     "rewrap": "node dist/admin/rewrap.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "reset-authenticator": "node dist/admin/reset-authenticator.js"
   },
   "dependencies": {
     "@aws-sdk/client-kms": "^3.1149.0",

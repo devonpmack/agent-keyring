@@ -5,7 +5,7 @@ import { audit } from '../domain/audit.js';
 import type { AppContext } from '../domain/context.js';
 import { addSeconds } from '../domain/context.js';
 import { AppError, forbidden, notFound } from '../domain/errors.js';
-import { clientDisplayName, redirectHost, type ClientMetadata } from '../domain/grants.js';
+import { clientDisplayName, type ClientMetadata } from '../domain/grants.js';
 import { describeScope, folderSchema, pathSchema, tagSchema } from '../domain/paths.js';
 import type { User } from '../domain/users.js';
 import { roleIn } from '../domain/users.js';
@@ -21,21 +21,36 @@ export type PendingAuthorization = {
   resource: string;
   expires_at: Date;
   client_name: string;
-  redirect_host: string;
+  redirect_kind: RedirectKind;
   client_first_seen: Date;
   previously_granted: boolean;
 };
 
-export async function getAuthorization(ctx: Pick<AppContext, 'db' | 'clock'>, id: string): Promise<PendingAuthorization> {
-  const [row] = await ctx.db.query<Omit<PendingAuthorization, 'client_name' | 'redirect_host' | 'previously_granted'> & { metadata: ClientMetadata }>(
+// Where the authorization code will actually be sent: an app on this computer
+// (loopback), a native app (private-use scheme), or a website.
+export type RedirectKind = 'loopback' | 'app' | 'web';
+
+export function redirectKind(uri: string): RedirectKind {
+  const url = new URL(uri);
+  if (url.protocol === 'http:') return 'loopback';
+  if (url.protocol === 'https:') return ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) ? 'loopback' : 'web';
+  return 'app';
+}
+
+export async function getAuthorization(ctx: Pick<AppContext, 'db' | 'clock'>, id: string, userId: string): Promise<PendingAuthorization> {
+  const [row] = await ctx.db.query<Omit<PendingAuthorization, 'client_name' | 'redirect_kind' | 'previously_granted'> & { metadata: ClientMetadata }>(
     `select a.*, c.metadata, c.created_at as client_first_seen
      from oauth_authorizations a join oauth_clients c on c.client_id = a.client_id where a.id = $1`,
     [id],
   );
   if (!row || row.expires_at <= ctx.clock.now()) throw notFound('This sign-in link expired. Start the connection again from your agent.');
-  const [prior] = await ctx.db.query('select 1 from grants where client_id = $1 limit 1', [row.client_id]);
+  // Only the user's own workspaces count, so another tenant cannot vouch for a client.
+  const [prior] = await ctx.db.query(
+    'select 1 from grants g join memberships m on m.workspace_id = g.workspace_id where g.client_id = $1 and m.user_id = $2 limit 1',
+    [row.client_id, userId],
+  );
   const { metadata, ...rest } = row;
-  return { ...rest, client_name: clientDisplayName(row.client_id, metadata), redirect_host: redirectHost(metadata), previously_granted: !!prior };
+  return { ...rest, client_name: clientDisplayName(row.client_id, metadata), redirect_kind: redirectKind(row.redirect_uri), previously_granted: !!prior };
 }
 
 const commaList = z
@@ -58,7 +73,7 @@ function withParams(uri: string, params: Record<string, string | null>): string 
 
 export async function approveAuthorization(ctx: AppContext, user: User, id: string, input: z.input<typeof consentSchema>, ip?: string): Promise<string> {
   const data = consentSchema.parse(input);
-  const authz = await getAuthorization(ctx, id);
+  const authz = await getAuthorization(ctx, id, user.id);
   if (!(await roleIn(ctx, user.id, data.workspaceId))) throw forbidden();
   const now = ctx.clock.now();
   const grantId = randomUUID();
@@ -92,8 +107,8 @@ export async function approveAuthorization(ctx: AppContext, user: User, id: stri
   return withParams(authz.redirect_uri, { code, state: authz.state });
 }
 
-export async function denyAuthorization(ctx: AppContext, id: string): Promise<string> {
-  const authz = await getAuthorization(ctx, id);
+export async function denyAuthorization(ctx: AppContext, user: User, id: string): Promise<string> {
+  const authz = await getAuthorization(ctx, id, user.id);
   await ctx.db.query('delete from oauth_authorizations where id = $1', [id]);
   return withParams(authz.redirect_uri, { error: 'access_denied', error_description: 'The user denied access', state: authz.state });
 }

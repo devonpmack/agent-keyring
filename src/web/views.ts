@@ -4,7 +4,7 @@ import type { GrantListing } from '../domain/grants.js';
 import { describeScope, joinPath } from '../domain/paths.js';
 import type { Passkey } from '../domain/passkeys.js';
 import type { SecretMeta } from '../domain/secrets.js';
-import type { Member, Membership } from '../domain/users.js';
+import type { Invite, Member, Membership } from '../domain/users.js';
 import type { PendingAuthorization } from '../oauth/consent.js';
 import { html, type Html } from './html.js';
 import type { Session } from './session.js';
@@ -308,11 +308,18 @@ ${rows.length >= 100 ? html`<p><a href="/audit?${params.toString()}">Older →</
 <p class="muted">Values, authenticator codes and tokens are never logged.</p>`);
 }
 
-export function settingsPage(chrome: PageChrome, opts: { enrolledAt: Date | null; enrollment?: { qr: string; secret: string }; passkeys: Passkey[] }): string {
+export function settingsPage(chrome: PageChrome, opts: { enrolledAt: Date | null; enrollment?: { qr: string; secret: string }; passkeys: Passkey[]; invites: Invite[] }): string {
   const s = chrome.session!;
   return layout('Settings', { ...chrome, nav: 'settings' }, html`
 <section class="narrow">
   <h1>Settings</h1>
+  ${opts.invites.length
+    ? html`<h2>Invitations</h2>
+      <p class="muted">Members of a workspace can approve each other's requests. Only join workspaces you trust.</p>
+      <ul class="plain">${opts.invites.map(i => html`<li><strong>${i.workspace_name}</strong> <span class="muted">invited ${fmt(i.created_at)}</span>
+        <form method="post" action="/invites/${i.workspace_id}/accept" class="inline">${csrf(s)}<button class="link">Accept</button></form> ·
+        <form method="post" action="/invites/${i.workspace_id}/decline" class="inline">${csrf(s)}<button class="link danger">Decline</button></form></li>`)}</ul>`
+    : ''}
   <h2>Authenticator app</h2>
   ${opts.enrollment
     ? html`<p>Scan this with Google Authenticator (or any TOTP app), then enter the code it shows.</p>
@@ -323,8 +330,13 @@ export function settingsPage(chrome: PageChrome, opts: { enrolledAt: Date | null
         <label>Code <input name="code" inputmode="numeric" pattern="[0-9 ]{6,7}" maxlength="7" required class="code"></label>
         <button class="primary">Confirm</button>
       </form>`
-    : html`<p>${opts.enrolledAt ? html`Enrolled ${fmt(opts.enrolledAt)}.` : 'Not enrolled. You need an authenticator to approve requests.'}</p>
-      <form method="post" action="/settings/authenticator">${csrf(s)}<button class="${opts.enrolledAt ? '' : 'primary'}">${opts.enrolledAt ? 'Replace authenticator' : 'Set up authenticator'}</button></form>`}
+    : opts.enrolledAt
+      ? html`<p>Enrolled ${fmt(opts.enrolledAt)}. To replace it, enter a current code from the old one.</p>
+        <form method="post" action="/settings/authenticator" class="row-left" autocomplete="off">${csrf(s)}
+          <input name="current_code" inputmode="numeric" pattern="[0-9 ]{6,7}" maxlength="7" required placeholder="Current code" class="code">
+          <button>Replace authenticator</button></form>`
+      : html`<p>Not enrolled. You need an authenticator to approve requests.</p>
+        <form method="post" action="/settings/authenticator">${csrf(s)}<button class="primary">Set up authenticator</button></form>`}
 
   <h2>Passkeys</h2>
   <p class="muted">Approve requests with Touch ID, Windows Hello or a security key. Passkeys only work on this site, so they can't be phished.</p>
@@ -367,7 +379,10 @@ export function consentPage(chrome: PageChrome, authz: PendingAuthorization, opt
   <h1>Connect <em>${authz.client_name}</em>?</h1>
   <dl>
     <dt>Client</dt><dd>${authz.client_name} <span class="muted">${authz.client_id}</span>${authz.previously_granted ? '' : html` <span class="pill pending">new client</span>`}</dd>
-    <dt>Sends you back to</dt><dd><code>${authz.redirect_host}</code></dd>
+    <dt>Sends access to</dt><dd><code>${authz.redirect_uri}</code>
+      ${authz.redirect_kind === 'web'
+        ? html`<p class="flash error">This is a website, not an app on your computer. Anyone who controls it gets this access. Only continue if you recognize it.</p>`
+        : html`<span class="muted">${authz.redirect_kind === 'loopback' ? '(an app on this computer)' : '(a desktop app)'}</span>`}</dd>
     <dt>Registered</dt><dd>${fmt(authz.client_first_seen)}</dd>
   </dl>
   <p>The agent will be able to list secret names in the scope you choose and fetch <strong>open</strong> secrets on its own. <strong>Approval</strong> secrets still need you every time.</p>

@@ -141,7 +141,9 @@ When an agent calls `get_secret` on an `approval` secret:
    from approved to consumed and releases the value once.
 
 Authenticator codes are single-use: once a code is accepted, no code from that
-time step or an earlier one is accepted again (RFC 6238 §5.2). Five wrong codes
+time step or an earlier one is accepted again (RFC 6238 §5.2). Replacing an
+enrolled authenticator needs a current code from it; for a lost phone an operator
+runs `npm run reset-authenticator -- user@example.com`. Five wrong codes
 lock that approver for 15 minutes and raise an alert. A request that gets five
 wrong codes is denied. Changing a secret's value or policy voids its open approvals.
 
@@ -150,7 +152,7 @@ wrong codes is denied. Changing a secret's value or policy voids its open approv
 | | `MODE=self_hosted` (default) | `MODE=managed` |
 |---|---|---|
 | Who can sign in | `OWNER_EMAIL` plus emails the owner adds | Any Google account |
-| Workspaces | One | One per new user; owners invite teammates |
+| Workspaces | One | Every user gets their own; invites to others must be accepted |
 | Tenant isolation | n/a | Every query is scoped by workspace, and every ciphertext binds its workspace ID as authenticated data |
 
 The managed mode is the same container. The hosted version would be run on it.

@@ -88,17 +88,27 @@ export type TotpCheck = { ok: true } | { ok: false; locked: boolean };
 // Verifies a user's authenticator code. Codes are single-use: a code is only
 // accepted for a time step later than the last accepted one (RFC 6238 §5.2),
 // so a code typed once, even into an agent chat, cannot be replayed.
-// Repeated failures lock approvals for the user and raise an alert.
+// Five consecutive failures lock approvals for the user and raise an alert.
 export async function verifyUserCode(ctx: AppContext, userId: string, code: string, workspaceId: string | null): Promise<TotpCheck> {
   const now = ctx.clock.now();
-  const [row] = await ctx.db.query<{
-    email: string;
-    totp_sealed: Sealed | null;
-    totp_last_step: number | null;
-    totp_locked_until: Date | null;
-  }>('select email, totp_sealed, totp_last_step, totp_locked_until from users where id = $1', [userId]);
+  const [row] = await ctx.db.query<{ email: string; totp_sealed: Sealed | null; totp_last_step: number | null }>(
+    'select email, totp_sealed, totp_last_step from users where id = $1',
+    [userId],
+  );
   if (!row?.totp_sealed) throw new AppError('no_authenticator', 'The approver has not enrolled an authenticator');
-  if (row.totp_locked_until && row.totp_locked_until > now) return { ok: false, locked: true };
+
+  // Count the attempt before checking it, in one statement, so parallel guesses
+  // cannot all be evaluated before the lock lands. An expired lock starts over.
+  const [attempt] = await ctx.db.query<{ attempts: number }>(
+    `update users set
+       totp_failed_count = case when totp_locked_until is not null then 1 else totp_failed_count + 1 end,
+       totp_locked_until = null
+     where id = $1 and (totp_locked_until is null or totp_locked_until <= $2)
+     returning totp_failed_count as attempts`,
+    [userId, now],
+  );
+  if (!attempt) return { ok: false, locked: true };
+  if (attempt.attempts > LOCK_AFTER_FAILURES) return lock(ctx, userId, row.email, workspaceId, now);
 
   const token = normalizeCode(code);
   let step: number | undefined;
@@ -123,18 +133,19 @@ export async function verifyUserCode(ctx: AppContext, userId: string, code: stri
     if (claimed.length === 1) return { ok: true };
   }
 
-  return recordFailure(ctx, userId, row.email, workspaceId, now);
+  if (attempt.attempts === LOCK_AFTER_FAILURES) return lock(ctx, userId, row.email, workspaceId, now);
+  return { ok: false, locked: false };
 }
 
-async function recordFailure(ctx: AppContext, userId: string, email: string, workspaceId: string | null, now: Date): Promise<TotpCheck> {
+async function lock(ctx: AppContext, userId: string, email: string, workspaceId: string | null, now: Date): Promise<TotpCheck> {
   const lockUntil = addSeconds(now, LOCK_SECONDS);
-  const [updated] = await ctx.db.query<{ totp_failed_count: number }>(
-    'update users set totp_failed_count = totp_failed_count + 1 where id = $1 returning totp_failed_count',
-    [userId],
+  const locked = await ctx.db.query(
+    'update users set totp_locked_until = $2, totp_failed_count = 0 where id = $1 and (totp_locked_until is null or totp_locked_until <= $3) returning id',
+    [userId, lockUntil, now],
   );
-  if (!updated || updated.totp_failed_count < LOCK_AFTER_FAILURES) return { ok: false, locked: false };
-  await ctx.db.query('update users set totp_locked_until = $2, totp_failed_count = 0 where id = $1', [userId, lockUntil]);
-  await audit(ctx, { workspaceId, actor: { type: 'system', label: 'agent-keyring' }, action: 'authenticator.lockout', outcome: 'denied', detail: { user: email, until: lockUntil.toISOString() } });
-  await ctx.notifier.notify({ type: 'totp_lockout', workspaceId, userEmail: email, until: lockUntil });
+  if (locked.length === 1) {
+    await audit(ctx, { workspaceId, actor: { type: 'system', label: 'agent-keyring' }, action: 'authenticator.lockout', outcome: 'denied', detail: { user: email, until: lockUntil.toISOString() } });
+    await ctx.notifier.notify({ type: 'totp_lockout', workspaceId, userEmail: email, until: lockUntil });
+  }
   return { ok: false, locked: true };
 }

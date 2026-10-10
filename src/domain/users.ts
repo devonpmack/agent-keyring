@@ -11,8 +11,9 @@ export type Membership = { workspace_id: string; workspace_name: string; role: R
 export type GoogleIdentity = { sub: string; email: string; emailVerified: boolean; name: string };
 
 // Self-hosted: one workspace, created on first boot with OWNER_EMAIL as owner;
-// everyone else must be on its allowlist. Managed: anyone may sign in and gets
-// a personal workspace unless they were already invited somewhere.
+// everyone else must be on its allowlist. Managed: anyone may sign in and always
+// gets a workspace of their own; invites to other workspaces wait for an
+// explicit accept, so nobody can pull a new user into a workspace they control.
 export async function ensureSelfHostedWorkspace(ctx: AppContext): Promise<void> {
   if (ctx.config.mode !== 'self_hosted' || !ctx.config.ownerEmail) return;
   const [existing] = await ctx.db.query('select id from workspaces limit 1');
@@ -42,23 +43,26 @@ export async function signIn(ctx: AppContext, identity: GoogleIdentity, ip?: str
     );
     if (!user) throw new Error('user upsert failed');
 
-    // Claim invites addressed to this email.
-    await q.query('update memberships set user_id = $1 where email = $2 and user_id is null', [user.id, email]);
-    let memberships = await q.query<{ workspace_id: string; role: Role }>(
+    if (ctx.config.mode === 'self_hosted') {
+      // The owner allowlisted this email for the only workspace there is.
+      await q.query('update memberships set user_id = $1 where email = $2 and user_id is null', [user.id, email]);
+    } else {
+      const [owned] = await q.query(`select 1 from memberships where user_id = $1 and role = 'owner' limit 1`, [user.id]);
+      if (!owned) {
+        const workspaceId = randomUUID();
+        const label = identity.name ? `${identity.name}'s keyring` : 'My keyring';
+        await q.query('insert into workspaces (id, name, created_at) values ($1, $2, $3)', [workspaceId, label, now]);
+        await q.query(
+          `insert into memberships (workspace_id, email, user_id, role, created_at) values ($1, $2, $3, 'owner', $4)`,
+          [workspaceId, email, user.id, now],
+        );
+      }
+    }
+    // Owner rows sort first, so a managed user lands in their own workspace.
+    const memberships = await q.query<{ workspace_id: string; role: Role }>(
       'select workspace_id, role from memberships where user_id = $1 order by role desc, created_at',
       [user.id],
     );
-
-    if (memberships.length === 0 && ctx.config.mode === 'managed') {
-      const workspaceId = randomUUID();
-      const label = identity.name ? `${identity.name}'s keyring` : 'My keyring';
-      await q.query('insert into workspaces (id, name, created_at) values ($1, $2, $3)', [workspaceId, label, now]);
-      await q.query(
-        `insert into memberships (workspace_id, email, user_id, role, created_at) values ($1, $2, $3, 'owner', $4)`,
-        [workspaceId, email, user.id, now],
-      );
-      memberships = [{ workspace_id: workspaceId, role: 'owner' }];
-    }
 
     const first = memberships[0];
     if (!first) {
@@ -107,7 +111,8 @@ export async function addMember(ctx: AppContext, actor: User, workspaceId: strin
   const parsed = emailSchema.safeParse(rawEmail.trim());
   if (!parsed.success) throw new AppError('invalid_email', 'Enter a valid email address');
   const email = parsed.data;
-  const [existingUser] = await ctx.db.query<{ id: string }>('select id from users where email = $1', [email]);
+  // Self-hosted members join immediately; managed invites stay pending until accepted.
+  const [existingUser] = ctx.config.mode === 'self_hosted' ? await ctx.db.query<{ id: string }>('select id from users where email = $1', [email]) : [];
   await ctx.db.query(
     `insert into memberships (workspace_id, email, user_id, role, created_at) values ($1, $2, $3, 'admin', $4)
      on conflict (workspace_id, email) do nothing`,
@@ -132,4 +137,28 @@ export async function removeMember(ctx: AppContext, actor: User, workspaceId: st
     }
   });
   await audit(ctx, { workspaceId, actor: { type: 'user', id: actor.id, label: actor.email }, action: 'member.remove', outcome: 'success', detail: { email } });
+}
+
+export type Invite = { workspace_id: string; workspace_name: string; created_at: Date };
+
+export async function listInvites(ctx: Pick<AppContext, 'db'>, user: User): Promise<Invite[]> {
+  return ctx.db.query<Invite>(
+    `select m.workspace_id, w.name as workspace_name, m.created_at
+     from memberships m join workspaces w on w.id = m.workspace_id
+     where m.email = $1 and m.user_id is null order by m.created_at`,
+    [user.email],
+  );
+}
+
+export async function acceptInvite(ctx: AppContext, user: User, workspaceId: string): Promise<void> {
+  const rows = await ctx.db.query(
+    'update memberships set user_id = $1 where workspace_id = $2 and email = $3 and user_id is null returning email',
+    [user.id, workspaceId, user.email],
+  );
+  if (rows.length !== 1) throw new AppError('no_invite', 'That invite no longer exists');
+  await audit(ctx, { workspaceId, actor: { type: 'user', id: user.id, label: user.email }, action: 'member.accept', outcome: 'success' });
+}
+
+export async function declineInvite(ctx: AppContext, user: User, workspaceId: string): Promise<void> {
+  await ctx.db.query('delete from memberships where workspace_id = $1 and email = $2 and user_id is null', [workspaceId, user.email]);
 }

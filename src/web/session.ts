@@ -33,6 +33,7 @@ export function cookieNames(ctx: Pick<AppContext, 'config'>) {
     secure,
     session: secure ? '__Host-ak_session' : 'ak_session',
     login: secure ? '__Host-ak_login' : 'ak_login',
+    flash: secure ? '__Host-ak_flash' : 'ak_flash',
   };
 }
 
