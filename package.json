@@ -1,0 +1,70 @@
+{
+  "name": "agent-keyring",
+  "version": "0.1.0",
+  "description": "A secrets vault for AI agents with per-secret human approval policy",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "agent-keyring": "dist/cli/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=.env src/main.ts",
+    "dev:google": "tsx dev/fake-google.ts",
+    "start": "node dist/main.js",
+    "build": "tsc -p tsconfig.build.json && cp -r src/db/migrations dist/db/",
+    "typecheck": "tsc --noEmit",
+    "migrate": "node dist/db/migrate-cli.js",
+    "rewrap": "node dist/admin/rewrap.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@aws-sdk/client-kms": "^3.1149.0",
+    "@electric-sql/pglite": "^0.5.8",
+    "@google-cloud/kms": "^6.2.1",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@simplewebauthn/browser": "^14.0.0",
+    "@simplewebauthn/server": "^14.0.3",
+    "cookie-parser": "^1.4.7",
+    "express": "^5.3.0",
+    "openid-client": "^6.8.8",
+    "otplib": "^13.5.0",
+    "pg": "^8.23.1",
+    "qrcode": "^1.5.4",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.10",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.5",
+    "@types/pg": "^8.23.1",
+    "@types/qrcode": "^1.5.6",
+    "@types/supertest": "^7.2.1",
+    "jose": "^6.2.12",
+    "supertest": "^7.3.1",
+    "tsx": "^4.23.15",
+    "typescript": "5.9",
+    "vitest": "^5.0.3"
+  },
+  "files": [
+    "dist",
+    "static",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/devonpmack/agent-keyring.git"
+  },
+  "keywords": [
+    "secrets",
+    "mcp",
+    "ai-agents",
+    "oauth",
+    "totp",
+    "vault",
+    "claude-code"
+  ]
+}
